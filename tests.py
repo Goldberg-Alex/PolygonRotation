@@ -6,7 +6,7 @@ from shapely.geometry import Polygon
 from shapely.geometry.point import Point
 
 from Plotting import interactive_plot
-from main import generate_random_convex_polygon, is_polygon_convex, find_extremes
+from main import generate_random_convex_polygon, is_polygon_convex, find_extremes, generate_kite
 
 
 class TestGenerateRandomConvexPolygon(unittest.TestCase):
@@ -87,6 +87,23 @@ class TestFullRotations(unittest.TestCase):
 
                     interactive_plot(polygon=polygon, offset=offset, pivot=Point(pivot))
 
+    def test_full_hypothesis_kite(self):
+        """check the hypothesis specifically for kite polygons"""
+        bound = 10
+        random.seed(0)
+        for _ in range(100):
+            polygon = generate_kite(15, 8, side_length=3)
+            offset = Point((random.randrange(-bound, bound), random.randrange(-bound, bound)))
+            for pivot in translate(polygon, offset.x, offset.y).exterior.coords:
+                extremes = find_extremes(polygon=polygon, offset=offset, pivot=Point(pivot))
+                if len(extremes) > 2:
+                    print(f"found example!"
+                          f"\npolygon = {polygon.exterior.coords.xy},"
+                          f"\noffset = {offset.coords.xy}"
+                          f"\npivot = {pivot}"
+                          f"{extremes=}")
+
+                    interactive_plot(polygon=polygon, offset=offset, pivot=Point(pivot))
 
 if __name__ == '__main__':
     unittest.main()

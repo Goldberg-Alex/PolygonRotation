@@ -1,4 +1,5 @@
 import copy
+import math
 import random
 from typing import List, Tuple, Any
 
@@ -126,3 +127,33 @@ def find_extremes(polygon: Polygon, offset: Point, pivot:Point) -> list:
     overlaps = np.round(list(overlaps.values()), 10)
     extremes = find_min_max_points(overlaps)
     return extremes
+
+
+def generate_kite(half_angle: float, diagonal: float, side_length: float) -> Polygon:
+    """
+    Generates a kite-shaped polygon using the given half-angle (in degrees), diagonal length, and side length.
+
+    :param half_angle: Half the angle (in degrees) between the diagonal and a side of the kite.
+    :param diagonal: The length of the major diagonal.
+    :param side_length: The length of each of the kite's sides.
+    :return: A Shapely Polygon representing the kite.
+    """
+    # Convert angle to radians
+    half_angle_rad = math.radians(half_angle)
+
+    # Calculate the perpendicular distance from the diagonal's center to the side
+    perpendicular_distance = side_length * math.sin(half_angle_rad)
+
+    # Calculate the horizontal offset for the side vertices
+    half_minor_diagonal = side_length * math.cos(half_angle_rad)
+
+    # Define the points of the kite
+    # (0, 0) is the center of the kite
+    top = (0, diagonal / 2)
+    bottom = (0, -diagonal / 2)
+    left = (-half_minor_diagonal, perpendicular_distance - (diagonal / 2))
+    right = (half_minor_diagonal, perpendicular_distance - (diagonal / 2))
+
+    # Create the kite polygon
+    kite = Polygon([top, right, bottom, left, top])
+    return kite
