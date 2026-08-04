@@ -6,7 +6,8 @@ from typing import List, Tuple, Any
 import matplotlib.pyplot as plt
 import numpy as np
 from shapely.affinity import rotate, translate
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon, Point, LineString
+from shapely.geometry.base import BaseGeometry
 
 
 def intersection_of_rotated_polygon(angle: float, polygon_A: Polygon, polygon_B: Polygon,
@@ -127,6 +128,204 @@ def find_extremes(polygon: Polygon, offset: Point, pivot:Point) -> list:
     overlaps = np.round(list(overlaps.values()), 10)
     extremes = find_min_max_points(overlaps)
     return extremes
+
+
+def find_long_diagonal(polygon: Polygon) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Finds the longest segment between any two vertices of the polygon.
+
+    For a kite this is the major diagonal.
+
+    Args:
+        polygon: The polygon to inspect.
+
+    Returns:
+        The two vertices spanning the longest diagonal.
+    """
+    coords = list(polygon.exterior.coords)[:-1]
+
+    best_pair = (coords[0], coords[1])
+    best_length = -1.0
+    for i in range(len(coords)):
+        for j in range(i + 1, len(coords)):
+            length = math.dist(coords[i], coords[j])
+            if length > best_length:
+                best_length = length
+                best_pair = (coords[i], coords[j])
+
+    return best_pair
+
+
+def _cross_section_length(polygon: Polygon, u: np.ndarray, v: np.ndarray, s: float) -> float:
+    """Length of the polygon's cross-section on the line perpendicular to `u` at offset `s`."""
+    coords = np.array(polygon.exterior.coords)
+    half_span = float(np.abs(coords @ v).max()) + 1.0
+
+    base = s * u
+    cut = LineString([base - half_span * v, base + half_span * v])
+    return polygon.intersection(cut).length
+
+
+def _slice_boundaries(polygon: Polygon, u: np.ndarray, v: np.ndarray, thickness: float) -> List[float]:
+    """Computes the slice boundary offsets along `u`.
+
+    Slicing starts at the tip of the long diagonal that is farthest from the widest
+    cross-section, advances in steps of `thickness` until that cross-section, restarts
+    exactly there and keeps going to the other tip. Therefore the widest cross-section is
+    always a boundary, and only the last slice of each of the two runs may be thinner.
+    """
+    coords = np.array(polygon.exterior.coords)[:-1]
+    projections = coords @ u
+    s_min, s_max = float(projections.min()), float(projections.max())
+
+    # The width of a convex polygon along `u` is piecewise linear in `s` with breakpoints at
+    # the vertex projections, so the widest cross-section is attained at one of them.
+    s_mid = max(projections, key=lambda s: _cross_section_length(polygon, u, v, float(s)))
+    s_mid = float(s_mid)
+
+    far_tip, near_tip = (s_min, s_max) if (s_mid - s_min) >= (s_max - s_mid) else (s_max, s_min)
+    direction = 1.0 if near_tip > far_tip else -1.0
+
+    boundaries = [far_tip]
+    for start, stop in ((far_tip, s_mid), (s_mid, near_tip)):
+        position = start
+        while (stop - position) * direction > 1e-12:
+            position = position + direction * thickness
+            if (position - stop) * direction > 0:
+                position = stop
+            boundaries.append(position)
+
+    return boundaries
+
+
+def slice_polygon(polygon: Polygon, thickness: float | None = None,
+                  default_slice_count: int = 20) -> List[Polygon]:
+    """Cuts a polygon into thin slices perpendicular to its long diagonal.
+
+    Args:
+        polygon: The polygon to slice.
+        thickness: The slice thickness along the long diagonal. Defaults to the polygon's
+            extent along the long diagonal divided by `default_slice_count`.
+        default_slice_count: Used to derive a default thickness when none is given.
+
+    Returns:
+        The slices, ordered starting from the tip farthest from the widest cross-section.
+        Slices that end up empty are kept as empty polygons so that indices stay aligned
+        between congruent polygons.
+    """
+    start, end = find_long_diagonal(polygon)
+    axis = np.array([end[0] - start[0], end[1] - start[1]], dtype=float)
+    u = axis / np.linalg.norm(axis)
+    v = np.array([-u[1], u[0]])
+
+    coords = np.array(polygon.exterior.coords)
+    extent = float((coords @ u).max() - (coords @ u).min())
+    if thickness is None:
+        thickness = extent / default_slice_count
+    if thickness <= 0:
+        raise ValueError("Slice thickness must be positive.")
+
+    boundaries = _slice_boundaries(polygon, u, v, thickness)
+    half_span = float(np.abs(coords @ v).max()) + 1.0
+
+    slices: List[Polygon] = []
+    for lower, upper in zip(boundaries[:-1], boundaries[1:]):
+        strip = Polygon([lower * u - half_span * v,
+                         upper * u - half_span * v,
+                         upper * u + half_span * v,
+                         lower * u + half_span * v])
+        piece = polygon.intersection(strip)
+        if piece.is_empty:
+            slices.append(Polygon())
+        elif isinstance(piece, Polygon):
+            slices.append(piece)
+        else:
+            slices.append(Polygon(piece.convex_hull))
+
+    return slices
+
+
+def neighbour_slice_intersections(slices_A: List[Polygon], slices_B: List[Polygon],
+                                  neighbourhood: Tuple[int, ...] = (-1, 0, 1)) -> List[BaseGeometry]:
+    """Collects the pairwise slice intersections summed by `neighbour_slice_overlap`.
+
+    For every slice index `i` of A, the intersection with slices `i + k` of B is collected
+    for each `k` in `neighbourhood`. Out-of-range indices are skipped.
+
+    Args:
+        slices_A: The slices of the fixed polygon.
+        slices_B: The slices of the rotated polygon.
+        neighbourhood: The relative slice indices to pair up.
+
+    Returns:
+        The non-empty intersection geometries, one per overlapping slice pair. The same
+        region can appear more than once when a slice of A overlaps several slices of B,
+        which mirrors how the areas are summed.
+    """
+    intersections: List[BaseGeometry] = []
+    for i, slice_A in enumerate(slices_A):
+        if slice_A.is_empty:
+            continue
+        min_x, min_y, max_x, max_y = slice_A.bounds
+        for k in neighbourhood:
+            j = i + k
+            if not 0 <= j < len(slices_B):
+                continue
+            slice_B = slices_B[j]
+            if slice_B.is_empty:
+                continue
+            other_min_x, other_min_y, other_max_x, other_max_y = slice_B.bounds
+            if other_min_x > max_x or other_max_x < min_x or other_min_y > max_y or other_max_y < min_y:
+                continue
+            piece = slice_A.intersection(slice_B)
+            if not piece.is_empty:
+                intersections.append(piece)
+
+    return intersections
+
+
+def neighbour_slice_overlap(slices_A: List[Polygon], slices_B: List[Polygon],
+                            neighbourhood: Tuple[int, ...] = (-1, 0, 1)) -> float:
+    """Sums the overlap of each slice of A with the neighbouring slices of B.
+
+    For every slice index `i` of A, the overlap with slices `i + k` of B is accumulated for
+    each `k` in `neighbourhood`. Out-of-range indices are skipped.
+
+    Args:
+        slices_A: The slices of the fixed polygon.
+        slices_B: The slices of the rotated polygon.
+        neighbourhood: The relative slice indices to pair up.
+
+    Returns:
+        The total overlap area.
+    """
+    return sum(piece.area for piece in neighbour_slice_intersections(slices_A, slices_B, neighbourhood))
+
+
+def calculate_full_rotation_slice_overlap(polygon: Polygon, pivot: Point, offset: Point,
+                                          thickness: float | None = None) -> dict[float, float]:
+    """Calculates the neighbouring-slice overlap sum for a full rotation.
+
+    The slices of the rotating polygon are cut once in its own frame and then transformed
+    rigidly, so they stay perpendicular to its long diagonal at every angle.
+
+    Args:
+        polygon: The fixed polygon.
+        pivot: The pivot point of the rotating polygon.
+        offset: The translation applied to the rotating polygon.
+        thickness: The slice thickness along the long diagonal.
+
+    Returns:
+        A mapping of rotation angle to the neighbouring-slice overlap sum.
+    """
+    slices_A = slice_polygon(polygon, thickness=thickness)
+    base_slices_B = [translate(piece, offset.x, offset.y) for piece in slice_polygon(polygon, thickness=thickness)]
+
+    overlaps: dict[float, float] = {}
+    for angle in np.linspace(0.0, 2 * np.pi, 360):
+        slices_B = [rotate(piece, angle, origin=pivot, use_radians=True) for piece in base_slices_B]
+        overlaps[angle] = neighbour_slice_overlap(slices_A, slices_B)
+
+    return overlaps
 
 
 def generate_kite(half_angle: float, diagonal: float, side_length: float) -> Polygon:
